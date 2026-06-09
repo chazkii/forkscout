@@ -1,5 +1,6 @@
 """Fork discovery service for finding and analyzing repository forks."""
 
+import asyncio
 import logging
 from datetime import datetime
 
@@ -37,6 +38,7 @@ class ForkDiscoveryService:
         min_activity_days: int = 365,
         min_commits_ahead: int = 1,
         max_forks_to_analyze: int = 100,
+        max_concurrent_comparisons: int = 5,
     ):
         """Initialize fork discovery service.
 
@@ -46,6 +48,7 @@ class ForkDiscoveryService:
             min_activity_days: Minimum days since last activity to consider fork active
             min_commits_ahead: Minimum commits ahead of parent to consider fork interesting
             max_forks_to_analyze: Maximum number of forks to analyze
+            max_concurrent_comparisons: Maximum concurrent fork comparison API calls
         """
         self.github_client = github_client
         self.data_collection_engine = data_collection_engine or ForkDataCollectionEngine()
@@ -53,6 +56,7 @@ class ForkDiscoveryService:
         self.min_activity_days = min_activity_days
         self.min_commits_ahead = min_commits_ahead
         self.max_forks_to_analyze = max_forks_to_analyze
+        self._max_concurrent_comparisons = max_concurrent_comparisons
 
     async def discover_forks(
         self, repository_url: str, disable_cache: bool = False
@@ -118,37 +122,47 @@ class ForkDiscoveryService:
                         : self.max_forks_to_analyze
                     ]
 
-                # Stage 2: Full analysis with expensive API calls for remaining forks
-                forks = []
-                api_calls_made = 0
+                # Stage 2: Full analysis for remaining forks.
+                #
+                # Each fork needs only a single comparison API call to get its
+                # ahead/behind counts. Previously this loop also issued a per-fork
+                # get_user() call (its result is only ever read for owner.login and
+                # owner.html_url, both already known from the fork list response) and
+                # ran strictly sequentially, so a repo with hundreds of active forks
+                # made ~2x the necessary calls one-at-a-time. We now skip get_user and
+                # run the comparisons concurrently with a bounded semaphore.
+                semaphore = asyncio.Semaphore(self._max_concurrent_comparisons)
 
-                for collected_fork in forks_needing_analysis:
-                    try:
-                        # Convert collected fork data to Repository object
-                        fork_repo = self._create_repository_from_collected_data(
-                            collected_fork
-                        )
+                async def build_fork(collected_fork: CollectedForkData) -> Fork | None:
+                    async with semaphore:
+                        try:
+                            fork_repo = self._create_repository_from_collected_data(
+                                collected_fork
+                            )
+                            return await self._create_fork_with_comparison_fast(
+                                fork_repo, parent_repo, disable_cache=disable_cache
+                            )
+                        except (GitHubPrivateRepositoryError, GitHubForkAccessError, GitHubEmptyRepositoryError) as e:
+                            logger.info(
+                                f"Skipping fork {collected_fork.metrics.full_name}: {self.github_client.get_user_friendly_error_message(e)}"
+                            )
+                            return None
+                        except GitHubTimeoutError as e:
+                            logger.warning(
+                                f"Timeout analyzing fork {collected_fork.metrics.full_name}: {e}"
+                            )
+                            return None
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to analyze fork {collected_fork.metrics.full_name}: {e}"
+                            )
+                            return None
 
-                        fork = await self._create_fork_with_comparison(
-                            fork_repo, parent_repo, disable_cache=disable_cache
-                        )
-                        forks.append(fork)
-                        api_calls_made += 3  # Estimate: compare, user, commits_ahead_behind
-                    except (GitHubPrivateRepositoryError, GitHubForkAccessError, GitHubEmptyRepositoryError) as e:
-                        logger.info(
-                            f"Skipping fork {collected_fork.metrics.full_name}: {self.github_client.get_user_friendly_error_message(e)}"
-                        )
-                        continue
-                    except GitHubTimeoutError as e:
-                        logger.warning(
-                            f"Timeout analyzing fork {collected_fork.metrics.full_name}: {e}"
-                        )
-                        continue
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to analyze fork {collected_fork.metrics.full_name}: {e}"
-                        )
-                        continue
+                fork_results = await asyncio.gather(
+                    *(build_fork(cf) for cf in forks_needing_analysis)
+                )
+                forks = [fork for fork in fork_results if fork is not None]
+                api_calls_made = len(forks)  # One comparison call per analyzed fork
 
                 total_potential_calls = len(fork_data_result.collected_forks) * 3
                 actual_calls = api_calls_made + fork_data_result.stats.api_calls_made
@@ -511,6 +525,71 @@ class ForkDiscoveryService:
             owner=owner_user,
             commits_ahead=comparison_data["ahead_by"],
             commits_behind=comparison_data["behind_by"],
+            last_activity=fork_repo.pushed_at,
+        )
+
+        logger.debug(
+            f"Fork {fork_repo.full_name}: {fork.commits_ahead} ahead, {fork.commits_behind} behind"
+        )
+
+        return fork
+
+    async def _create_fork_with_comparison_fast(
+        self, fork_repo: Repository, parent_repo: Repository, disable_cache: bool = False
+    ) -> Fork:
+        """Create a Fork object using a single comparison API call.
+
+        This is an optimized variant of ``_create_fork_with_comparison`` used during
+        discovery of repositories with many forks. It differs in two ways:
+
+        1. It does NOT call ``get_user`` for the fork owner. The owner User object is
+           only ever read for ``.login`` and ``.html_url`` downstream (report and CSV
+           generation), both of which are already known from the fork list response,
+           so a minimal User is constructed instead of spending an API call.
+        2. It compares directly against the fork's already-known ``default_branch``
+           (collected in stage 1), avoiding the extra ``get_repository`` call that the
+           generic batch helper makes just to look up the branch name.
+
+        The result is one API call per fork instead of two, and the caller runs these
+        concurrently.
+
+        Args:
+            fork_repo: Fork repository (already populated from collected fork data)
+            parent_repo: Parent repository
+            disable_cache: Whether to bypass cache for the comparison call
+
+        Returns:
+            Fork object with comparison data
+        """
+        logger.debug(f"Creating fork (fast) with comparison data for {fork_repo.full_name}")
+
+        comparison = await self.github_client.compare_commits_safe(
+            parent_repo.owner,
+            parent_repo.name,
+            parent_repo.default_branch,
+            f"{fork_repo.owner}:{fork_repo.default_branch}",
+        )
+
+        ahead_by = comparison.get("ahead_by", 0) if comparison else 0
+        behind_by = comparison.get("behind_by", 0) if comparison else 0
+
+        # Owner login and html_url are already known from the fork list response;
+        # build a minimal User rather than making an extra get_user API call.
+        owner_user = User(
+            id=0,
+            login=fork_repo.owner,
+            name=None,
+            email=None,
+            avatar_url=None,
+            html_url=f"https://github.com/{fork_repo.owner}",
+        )
+
+        fork = Fork(
+            repository=fork_repo,
+            parent=parent_repo,
+            owner=owner_user,
+            commits_ahead=ahead_by,
+            commits_behind=behind_by,
             last_activity=fork_repo.pushed_at,
         )
 

@@ -1210,12 +1210,13 @@ class TestForkDiscoveryDataCollectionIntegration:
         mock_data_collection_engine.exclude_no_commits_ahead.return_value = [
             sample_collected_fork_data
         ]
-        mock_github_client.get_commits_ahead_behind.return_value = {
+        # Discovery now uses a single concurrent compare_commits_safe call per fork
+        # (no separate get_commits_ahead_behind / get_user calls).
+        mock_github_client.compare_commits_safe.return_value = {
             "ahead_by": 5,
             "behind_by": 2,
             "total_commits": 7,
         }
-        mock_github_client.get_user.return_value = sample_user
 
         # Test
         result = await fork_discovery_service_with_mocks.discover_and_filter_forks(
