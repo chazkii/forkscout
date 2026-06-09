@@ -100,6 +100,24 @@ class ForkDiscoveryService:
                     f"API calls saved by automatic filtering: {fork_data_result.stats.api_calls_saved}"
                 )
 
+                # Cap the number of forks before the expensive Stage 2 API calls.
+                # Without this, repositories with many active forks issue thousands
+                # of sequential comparison requests during discovery, regardless of
+                # the user's --max-forks limit (which previously only applied after
+                # discovery completed).
+                if (
+                    self.max_forks_to_analyze
+                    and len(forks_needing_analysis) > self.max_forks_to_analyze
+                ):
+                    logger.info(
+                        f"Limiting discovery to {self.max_forks_to_analyze} forks "
+                        f"(max_forks_to_analyze) out of {len(forks_needing_analysis)} "
+                        f"forks needing analysis"
+                    )
+                    forks_needing_analysis = forks_needing_analysis[
+                        : self.max_forks_to_analyze
+                    ]
+
                 # Stage 2: Full analysis with expensive API calls for remaining forks
                 forks = []
                 api_calls_made = 0
